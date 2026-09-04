@@ -23,8 +23,10 @@ object FeatureManager {
         appContext = context
         TweakConfig.log("initializing all features...")
 
-        // 加载配置
-        TweakConfig.load(context)
+        // 加载配置（ContentProvider 方案，无 root）
+        TweakConfig.loadAndWatchFromProvider(context) {
+            Rotation180Feature.applyConfig()
+        }
 
         // 初始化各功能（按需加）
         Rotation180Feature.init(lpparam, context)

@@ -1,30 +1,115 @@
 package com.gtlx.launchertweaks.config
 
 import android.content.Context
-import android.os.Environment
-import android.os.FileObserver
+import android.database.ContentObserver
+import android.net.Uri
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
 import de.robv.android.xposed.XposedBridge
 import java.io.File
 import java.io.FileInputStream
+import java.io.FileOutputStream
 import java.util.Properties
 
 /**
- * 配置管理 —— App 端写，SystemUI/Launcher 端读
+ * 配置管理 —— ContentProvider 跨进程共享（无 root 标准方案）
  *
- * 配置同步方案：root + /data/local/tmp/（详见 lsposed-module-dev 技能）
- * 优先读外部存储，其次 /data/local/tmp/，最后内部私有目录兜底
+ * App 端写本地文件 + 更新内存 + notifyChange；
+ * 目标进程通过 ContentResolver.call() 读配置，ContentObserver 监听热更新。
  */
 object TweakConfig {
     private const val TAG = "LauncherTweaks"
     private const val CONFIG_FILE = "launcher_tweaks.conf"
+    private const val KEY_180 = "enable_180_rotation"
+    private const val KEY_AUTO = "enable_auto_rotate"
 
-    // 开关项
-    var enable180Rotation = true   // 桌面 180° 旋转
-    var enableAutoRotate = true    // 桌面自动旋转总开关（如果 Launcher 锁了方向）
+    var enable180Rotation = true
+    var enableAutoRotate = true
 
-    private var fileObserver: FileObserver? = null
-    private var configFile: File? = null
+    private var observer: ConfigContentObserver? = null
+    private var listeners = mutableListOf<() -> Unit>()
+
+    // ===== 目标进程（Launcher）端 =====
+
+    fun loadAndWatchFromProvider(context: Context, onChanged: () -> Unit) {
+        loadFromProvider(context)
+        listeners.add(onChanged)
+        if (observer == null) {
+            observer = ConfigContentObserver(Handler(Looper.getMainLooper())) {
+                loadFromProvider(context)
+                listeners.forEach { it() }
+            }
+            context.contentResolver.registerContentObserver(
+                ConfigProvider.CONTENT_URI, true, observer!!
+            )
+            log("config ContentObserver registered")
+        }
+    }
+
+    private fun loadFromProvider(context: Context) {
+        try {
+            val result = context.contentResolver.call(
+                ConfigProvider.CONTENT_URI,
+                ConfigProvider.METHOD_GET_CONFIG,
+                null, null
+            )
+            if (result != null) {
+                enable180Rotation = result.getBoolean(ConfigProvider.KEY_ENABLE_180, true)
+                enableAutoRotate = result.getBoolean(ConfigProvider.KEY_ENABLE_AUTO, true)
+                log("config loaded from provider: 180=$enable180Rotation, auto=$enableAutoRotate")
+                return
+            }
+        } catch (t: Throwable) {
+            log("loadFromProvider failed: ${t.message}")
+        }
+        log("fallback to defaults")
+    }
+
+    // ===== App 端 =====
+
+    fun saveFromUi(context: Context, enable180: Boolean, enableAuto: Boolean) {
+        // 1. 写本地文件
+        Thread {
+            try {
+                val file = File(context.filesDir, CONFIG_FILE)
+                val props = Properties()
+                props.setProperty(KEY_180, enable180.toString())
+                props.setProperty(KEY_AUTO, enableAuto.toString())
+                FileOutputStream(file).use { props.store(it, "LauncherTweaks config") }
+                file.setReadable(true, false)
+                log("config saved to file: 180=$enable180, auto=$enableAuto")
+            } catch (t: Throwable) {
+                logE("save config FAILED", t)
+            }
+        }.start()
+
+        // 2. 更新内存值
+        enable180Rotation = enable180
+        enableAutoRotate = enableAuto
+
+        // 3. 通知 ContentObserver
+        try {
+            context.contentResolver.notifyChange(ConfigProvider.CONTENT_URI, null)
+        } catch (_: Throwable) {}
+    }
+
+    fun saveFromProvider(context: Context, enable180: Boolean, enableAuto: Boolean) {
+        saveFromUi(context, enable180, enableAuto)
+    }
+
+    fun loadFromFile(context: Context) {
+        try {
+            val file = File(context.filesDir, CONFIG_FILE)
+            if (!file.exists()) return
+            val props = Properties()
+            FileInputStream(file).use { props.load(it) }
+            enable180Rotation = props.getProperty(KEY_180, "true")?.toBoolean() ?: true
+            enableAutoRotate = props.getProperty(KEY_AUTO, "true")?.toBoolean() ?: true
+        } catch (_: Throwable) {}
+    }
+
+    // ===== 内部 =====
 
     fun log(msg: String) {
         Log.i(TAG, msg)
@@ -36,102 +121,14 @@ object TweakConfig {
         try { XposedBridge.log("[$TAG] ERROR: $msg") } catch (_: Throwable) {}
     }
 
-    /** 从配置文件加载（SystemUI/Launcher 端调用） */
-    fun load(context: Context) {
-        val f = getConfigFile(context)
-        if (f == null) {
-            log("no config file found, using defaults")
-            return
+    private class ConfigContentObserver(
+        handler: Handler,
+        private val onChange: () -> Unit
+    ) : ContentObserver(handler) {
+        override fun onChange(selfChange: Boolean, uri: Uri?) {
+            super.onChange(selfChange, uri)
+            Log.d(TAG, "config ContentObserver onChange")
+            onChange()
         }
-        configFile = f
-        try {
-            val props = Properties()
-            FileInputStream(f).use { props.load(it) }
-            enable180Rotation = props.getProperty("enable_180_rotation", "true")?.toBoolean() ?: true
-            enableAutoRotate = props.getProperty("enable_auto_rotate", "true")?.toBoolean() ?: true
-            log("config loaded from ${f.absolutePath}: 180_rotation=$enable180Rotation, auto_rotate=$enableAutoRotate")
-        } catch (t: Throwable) {
-            logE("load config FAILED", t)
-        }
-
-        // 启动文件监听，配置变更热更新
-        startWatcher(context, f)
-    }
-
-    private fun startWatcher(context: Context, file: File) {
-        try {
-            fileObserver = object : FileObserver(file.parentFile!!, MODIFY or CREATE) {
-                override fun onEvent(event: Int, path: String?) {
-                    if (path == file.name) {
-                        log("config file changed, reloading...")
-                        load(context)
-                        // 通知功能模块重新应用配置
-                        com.gtlx.launchertweaks.feature.FeatureManager.onConfigChanged()
-                    }
-                }
-            }
-            fileObserver?.startWatching()
-            log("config watcher started (${file.absolutePath})")
-        } catch (t: Throwable) {
-            logE("start watcher FAILED", t)
-        }
-    }
-
-    private fun getConfigFile(context: Context): File? {
-        // 1. 外部存储 App 私有目录
-        try {
-            val extDir = File(
-                Environment.getExternalStorageDirectory(),
-                "Android/data/com.gtlx.launchertweaks/files/$CONFIG_FILE"
-            )
-            if (extDir.exists()) return extDir
-        } catch (_: Throwable) {}
-        // 2. /data/local/tmp/ 兜底（App 有 root 时会复制一份到这）
-        try {
-            val tmpFile = File("/data/local/tmp/$CONFIG_FILE")
-            if (tmpFile.exists()) return tmpFile
-        } catch (_: Throwable) {}
-        // 3. App 内部私有目录（只有 root 才能读到）
-        try {
-            val appDir = File("/data/data/com.gtlx.launchertweaks/files/$CONFIG_FILE")
-            if (appDir.exists()) return appDir
-        } catch (_: Throwable) {}
-        // 4. 从 context 拿
-        try {
-            val f = File(context.getExternalFilesDir(null), CONFIG_FILE)
-            if (f.exists()) return f
-        } catch (_: Throwable) {}
-        return null
-    }
-
-    /** App 端保存配置 */
-    fun saveFromUi(context: Context, enable180: Boolean, enableAuto: Boolean) {
-        Thread {
-            try {
-                val extDir = context.getExternalFilesDir(null)
-                val dir = extDir ?: context.filesDir
-                val file = File(dir, CONFIG_FILE)
-                val props = Properties()
-                props.setProperty("enable_180_rotation", enable180.toString())
-                props.setProperty("enable_auto_rotate", enableAuto.toString())
-                java.io.FileOutputStream(file).use { props.store(it, "LauncherTweaks config") }
-                file.setReadable(true, false)
-
-                // 用 root 权限复制到 /data/local/tmp/
-                try {
-                    val proc = Runtime.getRuntime().exec(arrayOf(
-                        "su", "-c",
-                        "cp ${file.absolutePath} /data/local/tmp/$CONFIG_FILE && chmod 644 /data/local/tmp/$CONFIG_FILE"
-                    ))
-                    val code = proc.waitFor()
-                    log("sync config to /data/local/tmp exitCode=$code")
-                } catch (t: Throwable) {
-                    logE("sync config to tmp FAILED", t)
-                }
-                log("config saved: 180=$enable180, auto=$enableAuto, path=${file.absolutePath}")
-            } catch (t: Throwable) {
-                logE("save config FAILED", t)
-            }
-        }.start()
     }
 }
