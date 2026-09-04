@@ -53,8 +53,11 @@ class MainActivity : Activity() {
             "💡 使用说明",
             "• 修改后点「重启桌面」生效\n" +
             "• 180° 旋转需要系统开启「自动旋转」\n" +
-            "• 支持 LineageOS Trebuchet / AOSP Launcher3 / Pixel Launcher\n" +
-            "• 完全不需要 root 权限"
+            "• 支持 LineageOS Trebuchet / AOSP Launcher3 / Pixel Launcher\n\n" +
+            "🔐 关于权限：\n" +
+            "• 核心功能（180°旋转解锁）无需任何权限\n" +
+            "• 有 Root 权限：支持一键重启桌面\n" +
+            "• 无 Root 权限：手动返回桌面或重启也能生效"
         ))
 
         root.addView(container)
