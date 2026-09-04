@@ -26,7 +26,15 @@ class ConfigProvider : ContentProvider() {
         const val KEY_ENABLE_AUTO = "enable_auto_rotate"
     }
 
-    override fun onCreate(): Boolean = true
+    override fun onCreate(): Boolean {
+        // ★ 修复：App 进程重启（熄屏/内存回收/杀后台）后 Provider 内存=默认值，
+        // 必须从磁盘文件重载，否则 Launcher 读到默认配置，表现为"配置还原"。
+        try {
+            val ctx = context ?: return true
+            TweakConfig.loadFromFile(ctx)
+        } catch (_: Throwable) {}
+        return true
+    }
 
     override fun query(
         uri: Uri, projection: Array<out String>?, selection: String?,
