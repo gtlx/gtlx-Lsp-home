@@ -78,7 +78,7 @@ class MainActivity : Activity() {
             setTypeface(null, android.graphics.Typeface.BOLD)
         })
         card.addView(TextView(this).apply {
-            text = "v1.0.0 · 让桌面更自由"
+            text = "v0.1.0 · 让桌面更自由"
             textSize = 13f
             setTextColor(Color.parseColor("#059669"))
             setPadding(0, dp(6), 0, 0)
